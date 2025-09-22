@@ -15,16 +15,15 @@ class DownloadRequest(BaseModel):
 
 # ================== تحميل الفيديو ==================
 async def download_video(link: str, file_type: str, cookies: str = None, debug: bool = False):
-    cookies_file_path = "cookies_temp.txt"
-    
-    if cookies:
-        with open(cookies_file_path, "w") as f:
-            f.write(cookies)
-
     # إعداد yt-dlp
     ydl_opts = {
         'outtmpl': '%(title)s.%(ext)s',
     }
+
+    if cookies:
+        ydl_opts['http_headers'] = {
+            'Cookie': cookies
+        }
 
     if file_type == "MP3":
         ydl_opts['format'] = 'bestaudio/best'
@@ -35,9 +34,6 @@ async def download_video(link: str, file_type: str, cookies: str = None, debug: 
         }]
     else: # MP4
         ydl_opts['format'] = 'bestvideo+bestaudio/best'
-
-    if cookies:
-        ydl_opts['cookiefile'] = cookies_file_path
 
     try:
         loop = asyncio.get_event_loop()
@@ -68,9 +64,6 @@ async def download_video(link: str, file_type: str, cookies: str = None, debug: 
         else:
             error_msg = str(e).split("\n")[0]
             raise HTTPException(status_code=400, detail=f"حدث خطأ: {error_msg}")
-    finally:
-        if os.path.exists(cookies_file_path):
-            os.remove(cookies_file_path)
 
 
 @app.post("/api/download")
