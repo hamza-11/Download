@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import yt_dlp
@@ -97,23 +97,21 @@ async def api_download(request: DownloadRequest, http_request: Request):
         else:
             raise HTTPException(status_code=500, detail=str(e))
 
+def remove_file(path: str):
+    """دالة لحذف الملف بأمان."""
+    try:
+        os.remove(path)
+        print(f"تم حذف الملف بنجاح: {path}")
+    except Exception as e:
+        print(f"خطأ أثناء محاولة حذف الملف {path}: {e}")
+
 @app.get("/downloads/{file_name}")
-async def download_file(file_name: str):
+async def download_file(file_name: str, background_tasks: BackgroundTasks):
     file_path = os.path.join(DOWNLOADS_DIR, file_name)
     if os.path.exists(file_path):
-        # حذف الملف بعد إرساله لضمان عدم تراكم الملفات
-        response = FileResponse(file_path, media_type='application/octet-stream', filename=file_name)
-        
-        async def cleanup():
-            try:
-                await asyncio.sleep(5) # انتظر قليلاً قبل الحذف
-                os.remove(file_path)
-                print(f"تم حذف الملف: {file_path}")
-            except Exception as e:
-                print(f"خطأ أثناء حذف الملف {file_path}: {e}")
-
-        asyncio.create_task(cleanup())
-        return response
+        # إضافة مهمة الحذف لتعمل في الخلفية بعد إرسال الاستجابة
+        background_tasks.add_task(remove_file, file_path)
+        return FileResponse(file_path, media_type='application/octet-stream', filename=file_name)
     else:
         raise HTTPException(status_code=404, detail="لم يتم العثور على الملف")
 
