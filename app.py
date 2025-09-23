@@ -5,9 +5,14 @@ import yt_dlp
 import os
 import traceback
 import asyncio
-import shutil
+import uuid
 
 app = FastAPI()
+
+# ================== إدارة المهام والملفات ==================
+
+# قاموس لتخزين حالة المهام في الذاكرة
+tasks = {}
 
 # تأكد من وجود مجلد للتحميلات
 DOWNLOADS_DIR = "downloads"
@@ -19,87 +24,93 @@ class DownloadRequest(BaseModel):
     cookies: str = None
     file_type: str = "MP4"
 
-async def download_video(link: str, file_type: str, cookies: str = None, debug: bool = False):
-    # إعداد yt-dlp
-    output_template = os.path.join(DOWNLOADS_DIR, '%(title)s.%(ext)s')
-    ydl_opts = {
-        'outtmpl': output_template,
-        'keepvideo': False, # لا تحتفظ بملف الفيديو الأصلي بعد التحويل
-    }
+# ================== منطق تحميل الفيديو (يعمل في الخلفية) ==================
 
-    if cookies:
-        ydl_opts['http_headers'] = {
-            'Cookie': cookies
+async def run_download_task(task_id: str, link: str, file_type: str, cookies: str, base_url: str):
+    """
+    هذه هي المهمة الفعلية التي تعمل في الخلفية.
+    تقوم بتحميل الفيديو وتحديث حالة المهمة عند الانتهاء.
+    """
+    try:
+        # إعداد yt-dlp
+        output_template = os.path.join(DOWNLOADS_DIR, f"{task_id}_%(title)s.%(ext)s")
+        ydl_opts = {
+            'outtmpl': output_template,
+            'keepvideo': False,
         }
 
-    if file_type == "MP3":
-        ydl_opts['format'] = 'bestaudio/best'
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-    else: # MP4
-        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        if cookies:
+            ydl_opts['http_headers'] = {'Cookie': cookies}
 
+        if file_type == "MP3":
+            ydl_opts['format'] = 'bestaudio/best'
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        else: # MP4
+            ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
 
-    try:
-        loop = asyncio.get_event_loop()
+        # بدء التحميل
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(link, download=True))
+            info = ydl.extract_info(link, download=True)
             
             base_filename = ydl.prepare_filename(info)
             if file_type == "MP3":
-                file_name = os.path.splitext(base_filename)[0] + ".mp3"
+                final_filename = os.path.splitext(base_filename)[0] + ".mp3"
             else:
-                # yt-dlp قد يحفظ الفيديو بامتداد مختلف (مثل .mkv)، لذا نحتاج إلى التأكد من اسم الملف النهائي
-                file_name = base_filename if base_filename.endswith('.mp4') else os.path.splitext(base_filename)[0] + ".mp4"
+                final_filename = base_filename if base_filename.endswith('.mp4') else os.path.splitext(base_filename)[0] + ".mp4"
 
-
-        if os.path.exists(file_name):
-            return file_name
+        if os.path.exists(final_filename):
+            # بناء رابط التحميل وتحديث حالة المهمة
+            download_url = f"{base_url}downloads/{os.path.basename(final_filename)}"
+            tasks[task_id] = {
+                "status": "completed",
+                "download_url": download_url,
+                "file_name": os.path.basename(final_filename)
+            }
         else:
-            await asyncio.sleep(2)
-            if os.path.exists(file_name):
-                return file_name
-            raise HTTPException(status_code=500, detail="لم يتم العثور على الملف الذي تم تنزيله بعد المعالجة.")
+            raise FileNotFoundError("لم يتم العثور على الملف بعد المعالجة.")
 
     except Exception as e:
-        if debug:
-            error_details = traceback.format_exc()
-            print(error_details)
-            raise HTTPException(status_code=500, detail=f"حدث خطأ أثناء التحميل: {error_details}")
-        else:
-            error_msg = str(e).split("\n")[0]
-            raise HTTPException(status_code=400, detail=f"حدث خطأ: {error_msg}")
+        error_msg = str(e).split("\n")[0]
+        tasks[task_id] = {"status": "failed", "error": error_msg}
+        print(f"Task {task_id} failed: {traceback.format_exc()}")
 
-@app.post("/api/download")
-async def api_download(request: DownloadRequest, http_request: Request):
-    file_path = None
-    try:
-        file_path = await download_video(request.link, request.file_type, request.cookies)
-        
-        file_name = os.path.basename(file_path)
-        
-        # بناء رابط التحميل الكامل
-        base_url = str(http_request.base_url)
-        download_url = f"{base_url}downloads/{file_name}"
-        
-        return JSONResponse(content={"download_url": download_url, "file_name": file_name})
 
-    except Exception as e:
-        # حذف الملف إذا كان موجودًا وفشل الطلب
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        
-        if isinstance(e, HTTPException):
-            raise e
-        else:
-            raise HTTPException(status_code=500, detail=str(e))
+# ================== نقاط النهاية (API Endpoints) ==================
+
+@app.post("/api/start-download")
+async def start_download(request: DownloadRequest, http_request: Request, background_tasks: BackgroundTasks):
+    """
+    يبدأ مهمة تحميل جديدة ويعيد معرف المهمة على الفور.
+    """
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {"status": "processing"}
+    
+    base_url = str(http_request.base_url)
+    
+    # إضافة مهمة التحميل لتعمل في الخلفية
+    background_tasks.add_task(run_download_task, task_id, request.link, request.file_type, request.cookies, base_url)
+    
+    return {"task_id": task_id}
+
+@app.get("/api/task-status/{task_id}")
+async def get_task_status(task_id: str):
+    """
+    يستعلم عن حالة مهمة تحميل معينة.
+    """
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="لم يتم العثور على المهمة")
+    return task
 
 def remove_file(path: str):
-    """دالة لحذف الملف بأمان."""
+    """دالة لحذف الملف بأمان بعد فترة."""
     try:
+        # تأخير بسيط قبل الحذف للتأكد من اكتمال الإرسال
+        asyncio.run(asyncio.sleep(10))
         os.remove(path)
         print(f"تم حذف الملف بنجاح: {path}")
     except Exception as e:
@@ -107,6 +118,9 @@ def remove_file(path: str):
 
 @app.get("/downloads/{file_name}")
 async def download_file(file_name: str, background_tasks: BackgroundTasks):
+    """
+    يقوم بتقديم الملف النهائي للتحميل ويجدول حذفه.
+    """
     file_path = os.path.join(DOWNLOADS_DIR, file_name)
     if os.path.exists(file_path):
         # إضافة مهمة الحذف لتعمل في الخلفية بعد إرسال الاستجابة
@@ -117,4 +131,4 @@ async def download_file(file_name: str, background_tasks: BackgroundTasks):
 
 @app.get("/")
 def read_root():
-    return {"message": "مرحباً بك في API تحميل الفيديو"}
+    return {"message": "مرحباً بك في API تحميل الفيديو (نظام المهام)"}
