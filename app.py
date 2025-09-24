@@ -47,7 +47,7 @@ async def run_download_task(task_id: str, link: str, file_type: str, cookies: st
             ydl_opts['postprocessors'] = [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '128',
+                'preferredquality': '64',
             }]
         else: # MP4
             ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
